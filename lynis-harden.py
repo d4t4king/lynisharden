@@ -3,6 +3,7 @@
 import os
 import apt
 import ast
+import dnf
 import sys
 import pprint
 import argparse
@@ -15,6 +16,8 @@ from dataclasses import dataclass
 LYNIS_CUSTOM_PROFILE='/etc/lynis/custom.prf'
 LYNIS_REPORT_PATH='/var/log/lynis-report.dat'
 LYNIS_LOG_PATH='/var/log/lynis.log'
+DEBIAN_LIKE=["debian", "ubuntu", "linuxmint", "pop", "kali", "parrot"]
+RHEL_LIKE=["rhel", "centos", "fedora", "almalinux", "rocky", "oracle"]
 
 @dataclass
 class AssessmentDetail:
@@ -365,7 +368,25 @@ def read_lynis_report(report_path: str =LYNIS_REPORT_PATH, verbose: bool =False)
 
     return _lynis_report
 
-def is_apt_package_installed(package_name: str) -> bool:
+def _import_or_install(package_name: str, verbose: bool =False) -> Any:
+    try:
+        return __import__(package_name)
+    except ImportError:
+        _warn_print(verbose, f"Package '{package_name}' is not installed. Attempting to install...")
+        if get_distro(verbose) in DEBIAN_LIKE:
+            if install_apt_package(verbose, package_name):
+                _verbose_print(verbose, f"Successfully installed '{package_name}'.")
+                return __import__(package_name)
+            else:
+                cprint(f"ERROR: Failed to install '{package_name}'. Please install it manually.", "red", file=sys.stderr)
+                sys.exit(1)
+        else:
+            cprint(f"ERROR: Automatic installation of '{package_name}' is not supported on this distribution. Please install it manually.", "red", file=sys.stderr)
+            sys.exit(1)
+
+def is_apt_package_installed(package_name: str, verbose: bool =False) -> bool:
+    # TODO: Change to use subprocess to be more platform/distro agnostic.
+    # _import_or_install("apt", verbose)
     try:
         cache = apt.Cache()
         if package_name in cache:
@@ -383,6 +404,20 @@ def is_apt_package_installed(package_name: str) -> bool:
         except FileNotFoundError:
             cprint("ERROR: This system does not support dpkg/apt packages.", "red")
             return False
+
+def is_dnf_package_installed(package_name: str, verbose: bool =False) -> bool:
+    _import_or_install("dnf", verbose)
+    try:
+        base = dnf.Base()
+        base.fill_sack(load_system_repo=True, load_available_repos=False)
+
+        # Filter the installed packaged (@system) by name
+        installed_packages = base.sack.query().installed().filter(name=package_name) # type: ignore
+        return bool(installed_packages)
+
+    except Exception as e:
+        cprint(f"ERROR: Failed to check DNF package installation: {e}", "red", file=sys.stderr)
+        return False
 
 def install_apt_package(enabled: bool, package_name: str) -> bool:
     cache = apt.Cache()
@@ -409,6 +444,24 @@ def install_apt_package(enabled: bool, package_name: str) -> bool:
             return False
     except Exception as _error:
         cprint(f"ERROR: Installation failed: {_error}", "red", file=sys.stderr)
+        return False
+
+def install_dnf_package(enabled: bool, package_name: str) -> bool:
+    try:
+        # Runs 'dnf install -y <package_name> safely
+        subprocess.run(
+            ["dnf", "install", "-y", package_name],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        print(f"Successfully installed {package_name}")
+        return True
+    except subprocess.CalledProcessError as _error:
+        cprint(f"ERROR: Installation failed: {_error}", "red", file=sys.stderr)
+        return False
+    except FileNotFoundError:
+        cprint("ERROR: 'dnf' command not found. Ensure DNF is installed on your system.", "red", file=sys.stderr)
         return False
 
 def _append_file(file_path: str, content: str, verbose: bool =False) -> None:
@@ -495,6 +548,33 @@ def write_custom_profile_entry(test_id: str, verbose: bool) -> None:
     except Exception as e:
         cprint(f"ERROR: Failed to write to custom profile: {e}", "red", file=sys.stderr)
 
+def get_distro(verbose: bool =False) -> str:
+    try:
+        result = subprocess.run(
+            ["lsb_release", "-is"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if result.returncode == 0:
+            distro = result.stdout.strip().lower()
+            _verbose_print(verbose, f"Detected distribution: {distro}")
+            return distro
+        else:
+            cprint(f"ERROR: Failed to detect distribution: {result.stderr}", "red", file=sys.stderr)
+    except FileNotFoundError:
+        _warn_print(verbose, "ERROR: 'lsb_release' command not found. Attempting to access '/etc/os-release' for distribution information.")
+        try:
+            with open("/etc/os-release", "r", encoding='utf-8') as os_release_file:
+                for line in os_release_file:
+                    if line.startswith("ID="):
+                        distro = line.split("=")[1].strip().strip('"').lower()
+                        _verbose_print(verbose, f"Detected distribution: {distro}")
+                        return distro
+        except FileNotFoundError:
+            cprint("ERROR: '/etc/os-release' file not found.", "red", file=sys.stderr)
+    return "unknown"
+
 def main():
     __uid = os.getuid()
     __euid = os.geteuid()
@@ -535,11 +615,14 @@ def main():
         _warn_print(arguments.verbose, f"Warning: {warning.description} (Test ID: {warning.test_id})")
     
     package_installs_status = {}
-    if not is_apt_package_installed("ufw"):
-        package_installs_status["ufw"] = install_apt_package(arguments.verbose, "ufw")
-    else:
-        _verbose_print(arguments.verbose, f"Package 'ufw' is already installed.")
-        package_installs_status["ufw"] = True
+    if get_distro(arguments.verbose) in DEBIAN_LIKE:
+        if not is_apt_package_installed("ufw"):
+            package_installs_status["ufw"] = install_apt_package(arguments.verbose, "ufw")
+        else:
+            _verbose_print(arguments.verbose, f"Package 'ufw' is already installed.")
+            package_installs_status["ufw"] = True
+    elif get_distro(arguments.verbose) in RHEL_LIKE:
+        pass
 
     confirmed = arguments.yes_all
     for suggestion in lynis_report.get("suggestion[]", []):
