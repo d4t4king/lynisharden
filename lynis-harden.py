@@ -5,6 +5,7 @@ import apt
 import ast
 import dnf
 import sys
+import socket
 import pprint
 import argparse
 import datetime
@@ -13,10 +14,11 @@ from termcolor import cprint
 from typing import Literal,Any
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
-LYNIS_CUSTOM_PROFILE='/etc/lynis/custom.prf'
-LYNIS_REPORT_PATH='/var/log/lynis-report.dat'
-LYNIS_LOG_PATH='/var/log/lynis.log'
+LYNIS_CUSTOM_PROFILE=Path('/etc/lynis/custom.prf')
+LYNIS_REPORT_PATH=Path('/var/log/lynis-report.dat')
+LYNIS_LOG_PATH=Path('/var/log/lynis.log')
 DEBIAN_LIKE=["debian", "ubuntu", "linuxmint", "pop", "kali", "parrot"]
 RHEL_LIKE=["rhel", "centos", "fedora", "almalinux", "rocky", "oracle"]
 
@@ -102,6 +104,22 @@ def _verbose_print(enabled: bool, message: str) -> None:
 def _warn_print(enabled: bool, message: str) -> None:
     if enabled:
         cprint(f"WARNING: {message}", "yellow")
+
+def _dryrun_print(message: str) -> None:
+    cprint(f"DRY RUN: {message}", "cyan")
+
+def get_local_ip(verbose: bool =False) -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Does not need to be reachable
+        sock.connect(('8.8.8.8', 1))
+        local_ip = sock.getsockname()[0]
+    except Exception as e:
+        _warn_print(verbose, f"Error occurred while fetching local IP: {e}")
+        local_ip = "127.0.0.1"
+    finally:
+        sock.close()
+    return local_ip
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser("""
@@ -541,11 +559,23 @@ def list_locked_users(verbose: bool =False) -> list[str]:
     return locked_users
 
 def write_custom_profile_entry(test_id: str, verbose: bool) -> None:
+    if not os.path.exists(LYNIS_CUSTOM_PROFILE):
+        _warn_print(verbose, f"Custom profile file does not exist at {LYNIS_CUSTOM_PROFILE}. Creating it...")
+        LYNIS_CUSTOM_PROFILE.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with open("/etc/lynis/custom.prf", "a", encoding='utf-8') as custom_profile:
+        with open(LYNIS_CUSTOM_PROFILE, "r", encoding='utf-8') as custom_profile:
+            existing_entries = custom_profile.readlines()
+
+        for line in existing_entries:
+            stripped_line = line.strip()
+            if stripped_line == f"skip-test {test_id}" or stripped_line.startswith(f"skip-test {test_id} "):
+                _verbose_print(verbose, f"Custom profile already contains skip-test entry for {test_id}. Skipping append.")
+                return
+
+        with open(LYNIS_CUSTOM_PROFILE, "a", encoding='utf-8') as custom_profile:
             custom_profile.write(f"skip-test {test_id}\n")
     except FileNotFoundError:
-        cprint(f"ERROR: Custom profile file not found at /etc/lynis/custom.prf.", "red", file=sys.stderr)
+        cprint(f"ERROR: Custom profile file not found at {LYNIS_CUSTOM_PROFILE}.", "red", file=sys.stderr)
     except Exception as e:
         cprint(f"ERROR: Failed to write to custom profile: {e}", "red", file=sys.stderr)
 
@@ -575,6 +605,22 @@ def get_distro(verbose: bool =False) -> str:
         except FileNotFoundError:
             cprint("ERROR: '/etc/os-release' file not found.", "red", file=sys.stderr)
     return "unknown"
+
+def update_etc_hosts(verbose: bool =False) -> None:
+    hosts_file_path = Path("/etc/hosts")
+    try:
+        with open(hosts_file_path, "r", encoding='utf-8') as hosts_file:
+            lines = hosts_file.readlines()
+
+        _local_ip = get_local_ip(verbose)
+        _hostname = socket.gethostname()
+        updated_lines = []
+        for line in lines:
+            stripped_line = line.strip()
+            if not stripped_line.startswith(_local_ip):
+                updated_lines.append(f"{_local_ip} {_hostname}\n")
+    except Exception as e:
+        cprint(f"ERROR: Failed to update /etc/hosts: {e}", "red", file=sys.stderr)
 
 def main():
     __uid = os.getuid()
@@ -607,9 +653,10 @@ def main():
     report_start = datetime.datetime(1970, 1, 1, 0, 0, 0, tzinfo=ZoneInfo("UTC"))
     report_end = datetime.datetime(1970, 1, 1, 0, 0, 0, tzinfo=ZoneInfo("UTC"))
     if 'report_datetime_start' in lynis_report:
-        report_start = datetime.datetime.strptime(lynis_report['report_datetime_start'], "%Y-%m-%d %H:%M:%S")
+        report_start = datetime.datetime.strptime(lynis_report['report_datetime_start'], "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("UTC"))
     if 'report_datetime_end' in lynis_report:
-        report_end = datetime.datetime.strptime(lynis_report['report_datetime_end'], "%Y-%m-%d %H:%M:%S %z") or datetime.datetime.now()
+        report_end = datetime.datetime.strptime(lynis_report['report_datetime_end'], "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("UTC"))
+
     print(f"Report Start: {report_start}\tReport End: {report_end}")
     print(f"Report Duration: {report_end - report_start}")
     print(f"Report version: {".".join([str(lynis_report['report_version_major']), str(lynis_report['report_version_minor'])])}\tLynis version: {lynis_report['lynis_version']}")
@@ -651,7 +698,7 @@ def main():
         #region KRNL-5820: Disable core dumps
         if suggestion.test_id == "KRNL-5820":
             if arguments.dry_run:
-                _verbose_print(arguments.verbose, f"Dry run: Would disable core dumps.")
+                _dryrun_print("Would disable core dumps.")
             elif not confirmed:
                 confirmed = get_confirmation("Do you want to disable core dumps? (y/n): ")
                 if not confirmed:
@@ -663,13 +710,35 @@ def main():
                 disable_coredump(arguments.verbose)
         #endregion
 
+        #region AUTH-9262: Install a PAM module for password strength checking
+        if suggestion.test_id == "AUTH-9262":
+            if get_distro(arguments.verbose) in DEBIAN_LIKE:
+                if arguments.dry_run:
+                    _dryrun_print("Would install 'libpam-cracklib' package.")
+                else:
+                    if not is_apt_package_installed("libpam-cracklib"):
+                        package_installs_status["libpam-cracklib"] = install_apt_package(arguments.verbose, "libpam-cracklib")
+                    else:
+                        _verbose_print(arguments.verbose, f"Package 'libpam-cracklib' is already installed.")
+                        package_installs_status["libpam-cracklib"] = True
+            elif get_distro(arguments.verbose) in RHEL_LIKE:
+                if arguments.dry_run:
+                    _dryrun_print("Would install 'cracklib' package.")
+                else:
+                    if not is_dnf_package_installed("cracklib"):
+                        package_installs_status["cracklib"] = install_dnf_package(arguments.verbose, "cracklib")
+                    else:
+                        _verbose_print(arguments.verbose, f"Package 'cracklib' is already installed.")
+                    package_installs_status["cracklib"] = True
+        #endregion
+
         #region AUTH-9284: Unlock locked users
         if suggestion.test_id == "AUTH-9284":
             locked_users = list_locked_users(arguments.verbose)
             if locked_users:
                 _warn_print(arguments.verbose, f"Locked users found: {', '.join(locked_users)}")
                 if arguments.dry_run:
-                    _verbose_print(arguments.verbose, f"Dry run: Would unlock the following users: {', '.join(locked_users)}")
+                    _dryrun_print(f"Would unlock the following users: {', '.join(locked_users)}")
                 elif not confirmed:
                     confirmed = get_confirmation(f"Do you want to unlock the following users: {', '.join(locked_users)}? (y/n): ")
                     if not confirmed:
@@ -695,5 +764,54 @@ def main():
                 _verbose_print(arguments.verbose, f"No locked users found.")
             #endregion
 
+        #region AUTH-9328: Set umask
+        if suggestion.test_id == "AUTH-9328":
+            cprint(f"WARNING: Setting the umask to the suggested value (027) may have unintended consequences. Please review your system's requirements before proceeding.", "yellow", file=sys.stderr)
+            cprint(f"Current umask: {os.umask(0):03o}", "yellow", file=sys.stderr)
+            cprint(f"Adding this to the custom profile, since unwittingly changing the umask can break things.", "yellow", file=sys.stderr)
+            write_custom_profile_entry(suggestion.test_id, arguments.verbose)
+        #endregion
+
+        #region NAME-4404: Update /etc/hosts with local IP and hostname
+        if suggestion.test_id == "NAME-4404":
+            if arguments.dry_run:
+                _dryrun_print("Would update /etc/hosts with local IP and hostname.")
+            elif not confirmed:
+                confirmed = get_confirmation("Do you want to update /etc/hosts with local IP and hostname? (y/n): ")
+                if not confirmed:
+                    confirmed = get_confirmation("Would you like to add this check as an exception in the custom profile? (y/n): ")
+                    if confirmed:
+                        write_custom_profile_entry(suggestion.test_id, arguments.verbose)
+                    continue
+                _verbose_print(arguments.verbose, f"Updating /etc/hosts with local IP and hostname...")
+                update_etc_hosts(arguments.verbose)
+        #endregion
+
+        #region PKGS-7370: Install debsums utility
+        if suggestion.test_id == "PKGS-7370":
+            # Assume we're on a DEBIAN_LIKE system since debsums is a Debian utility.
+            if arguments.dry_run:
+                _dryrun_print("Would install 'debsums' package.")
+            else:
+                if not is_apt_package_installed("debsums"):
+                    package_installs_status["debsums"] = install_apt_package(arguments.verbose, "debsums")
+                else:
+                    _verbose_print(arguments.verbose, f"Package 'debsums' is already installed.")
+                    package_installs_status["debsums"] = True
+        #endregion
+
+        #region PKGS-7394: Install `apt-show-versions` utility
+        if suggestion.test_id == "PKGS-7394":
+            # Assume we're on a DEBIAN_LIKE system since apt-show-versions is a Debian utility.
+            if arguments.dry_run:
+                _dryrun_print("Would install 'apt-show-versions' package.")
+            else:
+                if not is_apt_package_installed("apt-show-versions"):
+                    package_installs_status["apt-show-versions"] = install_apt_package(arguments.verbose, "apt-show-versions")
+                else:
+                    _verbose_print(arguments.verbose, f"Package 'apt-show-versions' is already installed.")
+                    package_installs_status["apt-show-versions"] = True
+        #endregion
+        
 if __name__=='__main__':
     raise SystemExit(main())
