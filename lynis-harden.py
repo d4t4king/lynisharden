@@ -12,6 +12,7 @@ import subprocess
 from termcolor import cprint
 from typing import Literal,Any
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 LYNIS_CUSTOM_PROFILE='/etc/lynis/custom.prf'
 LYNIS_REPORT_PATH='/var/log/lynis-report.dat'
@@ -602,10 +603,14 @@ def main():
     # These checks (and corrections) are in no particular order.  They were written
     # in the order in which they were experienced on my test systems.
 
-    #region Print Header
-    print(f"Report Start: {lynis_report['report_datetime_start']}\tReport End: {lynis_report['report_datetime_end']}")
-    report_start = datetime.datetime.strptime(lynis_report['report_datetime_start'], "%Y-%m-%d %H:%M:%S")
-    report_end = datetime.datetime.strptime(lynis_report['report_datetime_end'], "%Y-%m-%d %H:%M:%S")
+    #region Print Report Metadata Header
+    report_start = datetime.datetime(1970, 1, 1, 0, 0, 0, tzinfo=ZoneInfo("UTC"))
+    report_end = datetime.datetime(1970, 1, 1, 0, 0, 0, tzinfo=ZoneInfo("UTC"))
+    if 'report_datetime_start' in lynis_report:
+        report_start = datetime.datetime.strptime(lynis_report['report_datetime_start'], "%Y-%m-%d %H:%M:%S")
+    if 'report_datetime_end' in lynis_report:
+        report_end = datetime.datetime.strptime(lynis_report['report_datetime_end'], "%Y-%m-%d %H:%M:%S %z") or datetime.datetime.now()
+    print(f"Report Start: {report_start}\tReport End: {report_end}")
     print(f"Report Duration: {report_end - report_start}")
     print(f"Report version: {".".join([str(lynis_report['report_version_major']), str(lynis_report['report_version_minor'])])}\tLynis version: {lynis_report['lynis_version']}")
     #endregion
