@@ -1,0 +1,7 @@
+# Python dependencies for the scripts in this repository
+termcolor>=2.0,<3.0
+
+# The hardening script also expects the host OS to provide Python bindings for
+# package management, which are not installed by pip:
+# - python3-apt on Debian/Ubuntu-based systems
+# - python3-dnf on RHEL/Fedora-based systems
