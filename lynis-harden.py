@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 
 import os
-import apt
+import re
+# import apt
 import ast
-import dnf
+# import dnf
 import sys
+import json
 import socket
 import pprint
 import argparse
 import datetime
+import tempfile
 import subprocess
 from termcolor import cprint
 from typing import Literal,Any
@@ -16,11 +19,32 @@ from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
-LYNIS_CUSTOM_PROFILE=Path('/etc/lynis/custom.prf')
-LYNIS_REPORT_PATH=Path('/var/log/lynis-report.dat')
-LYNIS_LOG_PATH=Path('/var/log/lynis.log')
-DEBIAN_LIKE=["debian", "ubuntu", "linuxmint", "pop", "kali", "parrot"]
-RHEL_LIKE=["rhel", "centos", "fedora", "almalinux", "rocky", "oracle"]
+#region CONSTANTS
+LYNIS_CUSTOM_PROFILE = Path('/etc/lynis/custom.prf')
+LYNIS_REPORT_PATH = Path('/var/log/lynis-report.dat')
+LYNIS_LOG_PATH = Path('/var/log/lynis.log')
+DEBIAN_LIKE = ["debian", "ubuntu", "linuxmint", "pop", "kali", "parrot"]
+RHEL_LIKE = ["rhel", "centos", "fedora", "almalinux", "rocky", "oracle"]
+COMPILER_PATHS = ["/usr/bin/c98-gcc", "/usr/bin/c99-gcc", "/usr/bin/gcc-11", \
+    "/usr/bin/clang", "/usr/bin/cc", "/usr/bin/c++", "/usr/bin/g++", "/usr/bin/as", \
+    "/usr/bin/x86_64-linux-gnu-gcc", "/usr/bin/x86_64-linux-gnu-g++", "/usr/bin/x86_64-linux-gnu-as", \
+    "/usr/bin/x86_64-linux-gnu-gcc-10", "/usr/bin/x86_64-linux-gnu-gcc-11", "/usr/bin/x86_64-linux-gnu-gcc-12", \
+    "/usr/bin/x86_64-linux-gnu-gcc-13", "/usr/bin/x86_64-linux-gnu-gcc-14", "/usr/bin/x86_64-linux-gnu-gcc-ar-10", \
+    "/usr/bin/x86_64-linux-gnu-gcc-ar-11", "/usr/bin/x86_64-linux-gnu-gcc-ar-12", \
+    "/usr/bin/x86_64-linux-gnu-gcc-ar-13", "/usr/bin/x86_64-linux-gnu-gcc-nm-10", \
+    "/usr/bin/x86_64-linux-gnu-gcc-nm-11", "/usr/bin/x86_64-linux-gnu-gcc-nm-12", \
+    "/usr/bin/x86_64-linux-gnu-gcc-nm-13", "/usr/bin/x86_64-linux-gnu-gcc-ranlib-10", \
+    "/usr/bin/x86_64-linux-gnu-gcc-ranlib-11", "/usr/bin/x86_64-linux-gnu-gcc-ranlib-12", \
+    "/usr/bin/x86_64-linux-gnu-gcc-ranlib-13", "/usr/bin/x86_64-linux-gnu-gcov-10", "/usr/bin/x86_64-linux-gnu-gcov-11", \
+    "/usr/bin/x86_64-linux-gnu-gcov-12", "/usr/bin/x86_64-linux-gnu-gcov-13", "/usr/bin/x86_64-linux-gnu-gcov-dump-10", \
+    "/usr/bin/x86_64-linux-gnu-gcov-dump-11", "/usr/bin/x86_64-linux-gnu-gcov-dump-12", \
+    "/usr/bin/x86_64-linux-gnu-gcov-dump-13", "/usr/bin/x86_64-linux-gnu-gcov-tool-10", \
+    "/usr/bin/x86_64-linux-gnu-gcov-tool-11", "/usr/bin/x86_64-linux-gnu-gcov-tool-12", \
+    "/usr/bin/x86_64-linux-gnu-gcov-tool-13", "/usr/bin/x86_64-linux-gnu-gcc-as"]
+HARDENING_DATA_FILE = "./hardening.conf"
+#endregion
+
+#region DataClasses
 
 @dataclass
 class AssessmentDetail:
@@ -92,6 +116,10 @@ class DeletedFile:
     _type: int
     size: str
 
+#endregion
+
+#region Script Utility Functions
+
 def _verbose_pretty_print(enabled: bool, _object: object, _indent: int =4) -> None:
     pretty_printer = pprint.PrettyPrinter(indent=_indent)
     if enabled:
@@ -105,10 +133,10 @@ def _warn_print(enabled: bool, message: str) -> None:
     if enabled:
         cprint(f"WARNING: {message}", "yellow")
 
-def _dryrun_print(message: str) -> None:
-    cprint(f"DRY RUN: {message}", "cyan")
+def _dryrun_print(message: str, *args, **kwargs) -> None:
+    cprint(f"DRY RUN: {message}", "cyan", kwargs)
 
-def get_local_ip(verbose: bool =False) -> str:
+def _get_local_ip(verbose: bool =False) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         # Does not need to be reachable
@@ -121,7 +149,7 @@ def get_local_ip(verbose: bool =False) -> str:
         sock.close()
     return local_ip
 
-def parse_arguments() -> argparse.Namespace:
+def _parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser("""
         Harden your linux for lynis.
     """)
@@ -133,6 +161,20 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--dry-run', action='store_true', help="Perform a dry run without making any changes.")
     parser.add_argument('--alt-lynis-report', help="Parse an alternate lynis-report.dat")
     return parser.parse_args()
+
+def _append_file(file_path: str, content: str, verbose: bool =False) -> None:
+    try:
+        with open(file_path, 'a', encoding='utf-8') as file:
+            file.write(content)
+        _verbose_print(verbose, f"Appended content to {file_path}.")
+    except FileNotFoundError:
+        cprint(f"ERROR: File {file_path} not found.", "red", file=sys.stderr)
+    except Exception as e:
+        cprint(f"ERROR: Failed to append to {file_path}: {e}", "red", file=sys.stderr)
+
+#endregion
+
+#region Script Support/Discovery Functions
 
 def parse_value(_value: str, key: str = "") -> Any:
     """Convert a raw report value to the most natural Python type."""
@@ -387,7 +429,10 @@ def read_lynis_report(report_path: str =LYNIS_REPORT_PATH, verbose: bool =False)
 
     return _lynis_report
 
-def _import_or_install(package_name: str, verbose: bool =False) -> Any:
+# This function needs some tweaking.  It works OK for non-apt/dnf modules, but things get wonky with 
+# circular references, etc.  Also, in order for it to work, you have to return the imported/installed
+# module name to a varaible of that name, so it exists in the script's namespace.
+def import_or_install(package_name: str, verbose: bool =False) -> Any:
     try:
         return __import__(package_name)
     except ImportError:
@@ -398,6 +443,13 @@ def _import_or_install(package_name: str, verbose: bool =False) -> Any:
                 return __import__(package_name)
             else:
                 cprint(f"ERROR: Failed to install '{package_name}'. Please install it manually.", "red", file=sys.stderr)
+                sys.exit(1)
+        elif get_distro(verbose) in RHEL_LIKE:
+            if install_dnf_package(verbose, package_name):
+                _verbose_print(verbose, f"Successfully installed '{package_name}'.")
+                return __import__(package_name)
+            else:
+                cprint(f"ERROR: Failed to install '{package_name}'.  Please install it manually.", "red", file=sys.stderr)
                 sys.exit(1)
         else:
             cprint(f"ERROR: Automatic installation of '{package_name}' is not supported on this distribution. Please install it manually.", "red", file=sys.stderr)
@@ -437,6 +489,175 @@ def is_dnf_package_installed(package_name: str, verbose: bool =False) -> bool:
     except Exception as e:
         cprint(f"ERROR: Failed to check DNF package installation: {e}", "red", file=sys.stderr)
         return False
+
+def load_etc_passwd(verbose: bool =False) -> dict[str, dict[str, str]]:
+    passwd_data = {}
+    try:
+        with open('/etc/passwd', 'r', encoding='utf-8') as passwd_file:
+            for line in passwd_file:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split(':')
+                if len(parts) >= 7:
+                    username, password, uid, gid, gecos, home_dir, shell = parts[:7]
+                    passwd_data[username] = {
+                        'password': password,
+                        'uid': int(uid),
+                        'gid': int(gid),
+                        'gecos': gecos,
+                        'home_dir': home_dir,
+                        'shell': shell
+                    }
+    except FileNotFoundError:
+        cprint("ERROR: /etc/passwd file not found.", "red", file=sys.stderr)
+    except Exception as e:
+        cprint(f"ERROR: Failed to read /etc/passwd: {e}", "red", file=sys.stderr)
+    return passwd_data
+
+def get_confirmation(prompt: str ="Do you want to proceed? (y/n): ") -> bool:
+    while True:
+        response = input(prompt).strip().lower()
+        if response in ('y', 'yes'):
+            return True
+        elif response in ('n', 'no'):
+            return False
+        else:
+            print("Please respond with 'y' or 'n'.")
+
+def list_locked_users(verbose: bool =False) -> list[str]:
+    __passwd_data = load_etc_passwd(verbose)
+    __non_interactive_shells = ('/sbin/nologin', '/usr/sbin/nologin', '/bin/false', '/bin/sync')
+    locked_users = []
+    try:
+        result = subprocess.run(
+            ["passwd", "-S", "-a"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "L":
+                    # We don't care if users that can't login interactively are locked, so we check their shell as well.
+                    if __passwd_data.get(parts[0], {}).get('shell') not in __non_interactive_shells:
+                        locked_users.append(parts[0])
+        else:
+            cprint(f"ERROR: Failed to list users: {result.stderr}", "red", file=sys.stderr)
+    except FileNotFoundError:
+        cprint("ERROR: 'passwd' command not found.", "red", file=sys.stderr)
+    return locked_users
+
+def get_distro(verbose: bool =False) -> str:
+    try:
+        result = subprocess.run(
+            ["lsb_release", "-is"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if result.returncode == 0:
+            distro = result.stdout.strip().lower()
+            _verbose_print(verbose, f"Detected distribution: {distro}")
+            return distro
+        else:
+            cprint(f"ERROR: Failed to detect distribution: {result.stderr}", "red", file=sys.stderr)
+    except FileNotFoundError:
+        _warn_print(verbose, "ERROR: 'lsb_release' command not found. Attempting to access '/etc/os-release' for distribution information.")
+        try:
+            with open("/etc/os-release", "r", encoding='utf-8') as os_release_file:
+                for line in os_release_file:
+                    if line.startswith("ID="):
+                        distro = line.split("=")[1].strip().strip('"').lower()
+                        _verbose_print(verbose, f"Detected distribution: {distro}")
+                        return distro
+        except FileNotFoundError:
+            cprint("ERROR: '/etc/os-release' file not found.", "red", file=sys.stderr)
+    return "unknown"
+
+def load_hardening_config(hardening_config: str | Path =Path("./hardening.conf"), verbose: bool =False) -> dict:
+    _verbose_print(verbose, f"Loading the hardening config.")
+    config = {}
+    # try:
+    with open(hardening_config, 'r', encoding="utf-8") as conf_file:
+        config = json.load(conf_file)
+        _verbose_pretty_print(verbose, config)
+    # except FileNotFoundError():
+    #     cprint(f"Could not file the hardening config ({hardening_config})!", "red", file=sys.stderr)
+    #     sys.ext(1)
+    return config
+
+def sed_file(target_file_path: str | Path, search_pattern: str, replacement_text: str, verbose: bool =False, dryrun: bool =False) -> bool:
+    """
+    Finds a pattern within a file and replaces it atomincally using a temporary file.
+
+    This function reads a file line by line to minimize memory consumption, making it 
+    highly efficient for large test streams.  It searchs for a regular expression
+    pattern.  When fiound, it repklaces the matched text with the provided replacement.
+    To encure data integrity, the modified stream is written to a temporary file
+    in the same directory.  Once successfully written, the temporary file atomically
+    overwritten the orifinal file, preventing corruption if the script terminates mid-way.
+
+    Args:
+        target_file_path: The absolute or relative path to the file being modified.
+        search_pattern: The regular excpression patter to find within the text.
+        replacement_text: The string that will replace the matched pattern.
+        verbose: Explains what the function is doing during execution.
+        dryrun: Simulates the operation without making actual file changes.
+
+    Returns: 
+        A bopolean indicating whether any pattern match and replacement occurred.
+    """
+    compiled_regex = re.compile(search_pattern)
+    match_found = False
+    file_directory = os.path.dirname(target_file_path)
+
+    _verbose_print(verbose, f"Opening file for stream processing: {target_file_path}")
+
+    # We open a temporary file in the same directory to guarantee an atomic os.replace later.
+    # delete=False is required because we manually rename and replace the file.
+    with(
+        open(target_file_path, "r", encoding="utf-8") as regular_file, 
+        tempfile.NamedTemporaryFile(
+            "w", dir=file_directory, delete=False, encoding="utf-8"
+        ) as temporary_file,
+    ):
+
+        for line_number, current_line in enumerate(regular_file, start=1):
+            if compiled_regex.search(current_line):
+                match_found = True
+                # Perform the regec substitution on the current line string stream
+                modified_line = compiled_regex.sub(
+                    replacement_text, current_line
+                )
+                # uncomment if commented
+                if '#' in modified_line:
+                    modified_line = modified_line.replace('#', '')
+                if verbose or dryrun:
+                    print(f"[MATCH] Line {line_number} matched pattern: '{search_pattern}'")
+                    print(f"  Original: {current_line.strip()}")
+                    print(f"  Proposed: {modified_line.strip()}")
+                temporary_file.write(modified_line)
+            else:
+                temporary_file.write(current_line)
+    if not match_found:
+        _verbose_print(verbose, f"No matching patterns found.  File remains unmodified.")
+        os.unlink(temporary_file.name)
+        return False
+
+    if dryrun:
+        _dryrun_print(f"Dry run active: Rolling back changes and removing temp file.")
+        os.unlink(temporary_file.name)
+        return True
+    
+    _verbose_print(f"Atomically overwriting original file: {target_file_path}")
+    os.replace(temporary_file.name, target_file_path)
+    return True
+
+#endregion
+
+#region Hardening Functions
 
 def install_apt_package(enabled: bool, package_name: str) -> bool:
     cache = apt.Cache()
@@ -483,80 +704,11 @@ def install_dnf_package(enabled: bool, package_name: str) -> bool:
         cprint("ERROR: 'dnf' command not found. Ensure DNF is installed on your system.", "red", file=sys.stderr)
         return False
 
-def _append_file(file_path: str, content: str, verbose: bool =False) -> None:
-    try:
-        with open(file_path, 'a', encoding='utf-8') as file:
-            file.write(content)
-        _verbose_print(verbose, f"Appended content to {file_path}.")
-    except FileNotFoundError:
-        cprint(f"ERROR: File {file_path} not found.", "red", file=sys.stderr)
-    except Exception as e:
-        cprint(f"ERROR: Failed to append to {file_path}: {e}", "red", file=sys.stderr)
-
-def get_confirmation(prompt: str ="Do you want to proceed? (y/n): ") -> bool:
-    while True:
-        response = input(prompt).strip().lower()
-        if response in ('y', 'yes'):
-            return True
-        elif response in ('n', 'no'):
-            return False
-        else:
-            print("Please respond with 'y' or 'n'.")
-
 def disable_coredump(verbose: bool =False) -> None:
     etc_security_limits_conf = '/etc/security/limits.conf'
     coredump_content = [ "* soft core 0\n", "* hard core 0\n", "# End of file\n" ]
     for content in coredump_content:
         _append_file(etc_security_limits_conf, content, verbose)
-
-def _load_etc_passwd(verbose: bool =False) -> dict[str, dict[str, str]]:
-    passwd_data = {}
-    try:
-        with open('/etc/passwd', 'r', encoding='utf-8') as passwd_file:
-            for line in passwd_file:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                parts = line.split(':')
-                if len(parts) >= 7:
-                    username, password, uid, gid, gecos, home_dir, shell = parts[:7]
-                    passwd_data[username] = {
-                        'password': password,
-                        'uid': int(uid),
-                        'gid': int(gid),
-                        'gecos': gecos,
-                        'home_dir': home_dir,
-                        'shell': shell
-                    }
-    except FileNotFoundError:
-        cprint("ERROR: /etc/passwd file not found.", "red", file=sys.stderr)
-    except Exception as e:
-        cprint(f"ERROR: Failed to read /etc/passwd: {e}", "red", file=sys.stderr)
-    return passwd_data
-
-def list_locked_users(verbose: bool =False) -> list[str]:
-    __passwd_data = _load_etc_passwd(verbose)
-    __non_interactive_shells = ('/sbin/nologin', '/usr/sbin/nologin', '/bin/false', '/bin/sync')
-    locked_users = []
-    try:
-        result = subprocess.run(
-            ["passwd", "-S", "-a"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                parts = line.split()
-                if len(parts) >= 2 and parts[1] == "L":
-                    # We don't care if users that can't login interactively are locked, so we check their shell as well.
-                    if __passwd_data.get(parts[0], {}).get('shell') not in __non_interactive_shells:
-                        locked_users.append(parts[0])
-        else:
-            cprint(f"ERROR: Failed to list users: {result.stderr}", "red", file=sys.stderr)
-    except FileNotFoundError:
-        cprint("ERROR: 'passwd' command not found.", "red", file=sys.stderr)
-    return locked_users
 
 def write_custom_profile_entry(test_id: str, verbose: bool) -> None:
     if not os.path.exists(LYNIS_CUSTOM_PROFILE):
@@ -579,33 +731,6 @@ def write_custom_profile_entry(test_id: str, verbose: bool) -> None:
     except Exception as e:
         cprint(f"ERROR: Failed to write to custom profile: {e}", "red", file=sys.stderr)
 
-def get_distro(verbose: bool =False) -> str:
-    try:
-        result = subprocess.run(
-            ["lsb_release", "-is"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        if result.returncode == 0:
-            distro = result.stdout.strip().lower()
-            _verbose_print(verbose, f"Detected distribution: {distro}")
-            return distro
-        else:
-            cprint(f"ERROR: Failed to detect distribution: {result.stderr}", "red", file=sys.stderr)
-    except FileNotFoundError:
-        _warn_print(verbose, "ERROR: 'lsb_release' command not found. Attempting to access '/etc/os-release' for distribution information.")
-        try:
-            with open("/etc/os-release", "r", encoding='utf-8') as os_release_file:
-                for line in os_release_file:
-                    if line.startswith("ID="):
-                        distro = line.split("=")[1].strip().strip('"').lower()
-                        _verbose_print(verbose, f"Detected distribution: {distro}")
-                        return distro
-        except FileNotFoundError:
-            cprint("ERROR: '/etc/os-release' file not found.", "red", file=sys.stderr)
-    return "unknown"
-
 def update_etc_hosts(verbose: bool =False) -> None:
     hosts_file_path = Path("/etc/hosts")
     try:
@@ -622,6 +747,26 @@ def update_etc_hosts(verbose: bool =False) -> None:
     except Exception as e:
         cprint(f"ERROR: Failed to update /etc/hosts: {e}", "red", file=sys.stderr)
 
+def harden_file_permissions(file_path: str, owner: str, mode: int, verbose: bool =False) -> None:
+    try:
+        if not os.path.exists(file_path):
+            _warn_print(verbose, f"File {file_path} does not exist. Skipping permission hardening.")
+            return
+
+        # Change ownership
+        uid = int(subprocess.check_output(["id", "-u", owner]).strip())
+        gid = int(subprocess.check_output(["id", "-g", owner]).strip())
+        os.chown(file_path, uid, gid)
+
+        # Change permissions
+        os.chmod(file_path, mode)
+
+        _verbose_print(verbose, f"Successfully hardened permissions for {file_path}: owner={owner}, mode={oct(mode)}")
+    except Exception as e:
+        cprint(f"ERROR: Failed to harden permissions for {file_path}: {e}", "red", file=sys.stderr)
+
+#endregion
+
 def main():
     __uid = os.getuid()
     __euid = os.geteuid()
@@ -630,7 +775,7 @@ def main():
         _warn_print(True, f"You should run this as root.")
         return sys.exit(1)
     
-    arguments = parse_arguments()
+    arguments = _parse_arguments()
     if arguments.debug:
         arguments.verbose = True
 
@@ -645,6 +790,8 @@ def main():
         lynis_report = read_lynis_report()
 
     _verbose_pretty_print(arguments.debug, lynis_report)
+
+    hardening_config = load_hardening_config()
 
     # These checks (and corrections) are in no particular order.  They were written
     # in the order in which they were experienced on my test systems.
@@ -662,19 +809,35 @@ def main():
     print(f"Report version: {".".join([str(lynis_report['report_version_major']), str(lynis_report['report_version_minor'])])}\tLynis version: {lynis_report['lynis_version']}")
     #endregion
 
-    # Start with the warnings
+    has_run = {
+        'SSH-7408': False
+    }
+    not_run = { }
+    package_installs_status = {}
+    os_distro = get_distro(arguments.verbose)
+
+    #region: Warnings
     for warning in lynis_report.get("warning[]", []):
         _warn_print(arguments.verbose, f"Warning: {warning.description} (Test ID: {warning.test_id})")
     
-    package_installs_status = {}
-    if get_distro(arguments.verbose) in DEBIAN_LIKE:
-        if not is_apt_package_installed("ufw"):
-            package_installs_status["ufw"] = install_apt_package(arguments.verbose, "ufw")
-        else:
-            _verbose_print(arguments.verbose, f"Package 'ufw' is already installed.")
-            package_installs_status["ufw"] = True
-    elif get_distro(arguments.verbose) in RHEL_LIKE:
-        pass
+        #region FIRE-4512 - Install and Configure Firewall
+        if warning.test_id == "FIRE-4512":
+            # iptables/nftables is installed but not configured.  Make sure the management/control app
+            # appropriate for the distro is installed, and setup some basic rules.
+            if os_distro in DEBIAN_LIKE:
+                if not is_apt_package_installed("ufw"):
+                    package_installs_status["ufw"] = install_apt_package(arguments.verbose, "ufw")
+                else:
+                    _verbose_print(arguments.verbose, f"Package 'ufw' is already installed.")
+                    package_installs_status["ufw"] = True
+            elif os_distro in RHEL_LIKE:
+                if not is_dnf_package_installed("firewalld"):
+                    package_installs_status["firewalld"] = install_dnf_package(arguments.verbose, "firewalld")
+                else:
+                    _verbose_print(arguments.verbose, f"Package 'firewalld' is already installed.")
+                    package_installs_status["firewalld"] = True
+        #endregion
+    #endregion
 
     confirmed = arguments.yes_all
     for suggestion in lynis_report.get("suggestion[]", []):
@@ -813,5 +976,70 @@ def main():
                     package_installs_status["apt-show-versions"] = True
         #endregion
         
+        #region HRDN-7222: Harden permissions on compilers
+        if suggestion.test_id == "HRDN-7222":
+            _warn_print(arguments.verbose, f"Hardening permissions on compilers may break some software builds. Please review your system's requirements before proceeding.")
+            if arguments.dry_run:
+                _dryrun_print(f"Would harden permissions on compilers.")
+            elif not confirmed:
+                confirmed = get_confirmation(f"Do you want to harden permissions on compilers? (y/n): ")
+                if not confirmed:
+                    confirmed = get_confirmation("Would you like to add this check as an exception in the custom profile? (y/n): ")
+                    if confirmed:
+                        write_custom_profile_entry(suggestion.test_id, arguments.verbose)
+                    continue
+                # Here you would add the logic to actually harden permissions on compilers if confirmed.
+                for compiler in COMPILER_PATHS:
+                    try:
+                        harden_file_permissions(compiler, "root", 0o700, arguments.verbose)
+                        _verbose_print(arguments.verbose, f"Permissions hardened for compiler '{compiler}' (owner=root, mode=0o700).")
+                    except Exception as e:
+                        cprint(f"ERROR: Failed to harden permissions for compiler '{compiler}': {e}", "red", file=sys.stderr)
+        #endregion 
+
+        #region NETW-3200: Disable dccp, sctp, rds, tipc
+        if suggestion.test_id == "NETW-3200":
+            _verbose_pretty_print(arguments.debug, suggestion)
+            _match = re.search(r"Determine if protocol \'(dccp|sctp|rds|tipc)\' is really needed", suggestion.description)
+            if _match:
+                _protocol = _match.group(1).strip()
+            else:
+                _warn_print(f"Didn't match a recognized protocol in string: {suggestion.description}")
+            if arguments.dry_run:
+                _dryrun_print(f"Disabling {_protocol}")
+            else:
+                if not confirmed:
+                    confirmed = get_confirmation(f"Would you like to disable the {_protcol} protocol? (y/n):f")
+                    if not confirmed:
+                        confirmed = get_confirmation("Would you like to add this check as an exception in the custom profile? (y/n): ")
+                        if confirmed:
+                            write_custom_profile_entry(suggestion.test_id, arguments.verbose)
+                        continue
+                _verbose_print(arguments.verbose, f"Disabling the '{_protocol}' protocol and kernel module.")
+                for content in [ f"install {_protocol} /bin/false", f"blacklist {_protocol}"]:
+                    _append_file(f"/etc/modprobe.d/{_protocol}.conf", content, arguments.verbose)
+                harden_file_permissions(f"/etc/modprobe.d/{_protocol}.conf", "root", 0o700, arguments.verbose)
+        #endregion
+
+        #region FILE-7524: Harden file permissions
+        # The tricky part with this one is we don't nececessarily know what files need correcting.
+        # Maybe we'll come back to this. lol
+        #endregion
+
+        #region SSH-7408: Harden SSH config
+        # also tricky....
+        if suggestion.test_id == "SSH-7408":
+            _verbose_print(arguments.verbose, f"Hardening SSH settings.")
+            _verbose_pretty_print(arguments.verbose, hardening_config['SSH-7408']['secure_sshd_config_settings'])
+            for pattern_key, value in hardening_config['SSH-7408']['secure_sshd_config_settings'].items():
+                if isinstance(value, str):
+
+                    replacement_text = f"{pattern_key} {value.lower()}"
+                else:
+                    replacement_text = f"{pattern_key} {value}"
+                # TODO: need to account for patterns moatching commented lines (and uncomment)
+                # TODO: need to check if the matched pattern already has the correct value.
+                sed_file("../sshd_config", pattern_key, replacement_text, arguments.verbose, arguments.dry_run)
+
 if __name__=='__main__':
     raise SystemExit(main())
