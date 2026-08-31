@@ -1037,7 +1037,7 @@ def main():
                     replacement_text = f"{pattern_key} {value.lower()}"
                 else:
                     replacement_text = f"{pattern_key} {value}"
-                # TODO: need to account for patterns moatching commented lines (and uncomment)
+                # DONE: need to account for patterns matching commented lines (and uncomment)
                 # TODO: need to check if the matched pattern already has the correct value.
                 sed_file("../sshd_config", pattern_key, replacement_text, arguments.verbose, arguments.dry_run)
 
