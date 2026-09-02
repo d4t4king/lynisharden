@@ -133,8 +133,9 @@ def _warn_print(enabled: bool, message: str) -> None:
     if enabled:
         cprint(f"WARNING: {message}", "yellow")
 
-def _dryrun_print(message: str, *args, **kwargs) -> None:
-    cprint(f"DRY RUN: {message}", "cyan", kwargs)
+def _dryrun_print(enabled: bool, message: str, *args, **kwargs) -> None:
+    if enabled:
+        cprint(f"DRY RUN: {message}", "cyan", kwargs)
 
 def _get_local_ip(verbose: bool =False) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -647,7 +648,7 @@ def sed_file(target_file_path: str | Path, search_pattern: str, replacement_text
         return False
 
     if dryrun:
-        _dryrun_print(f"Dry run active: Rolling back changes and removing temp file.")
+        _dryrun_print(dryrun, f"Dry run active: Rolling back changes and removing temp file.")
         os.unlink(temporary_file.name)
         return True
     
@@ -817,22 +818,34 @@ def main():
     os_distro = get_distro(arguments.verbose)
 
     #region: Warnings
+    __interations = 1
     for warning in lynis_report.get("warning[]", []):
         _warn_print(arguments.verbose, f"Warning: {warning.description} (Test ID: {warning.test_id})")
     
         #region FIRE-4512 - Install and Configure Firewall
         if warning.test_id == "FIRE-4512":
+            if not arguments.quiet:
+                print(f"{__iterations:03d} -- {warning.test_id}: =====================================================")
             # iptables/nftables is installed but not configured.  Make sure the management/control app
             # appropriate for the distro is installed, and setup some basic rules.
+            if arguments.dry_run:
+                _dryrun_print(arguments.dry_run, "Would install and configure a firewall.")
+
             if os_distro in DEBIAN_LIKE:
                 if not is_apt_package_installed("ufw"):
-                    package_installs_status["ufw"] = install_apt_package(arguments.verbose, "ufw")
+                    if arguments.dry_run:
+                        _dryrun_print(arguments.dry_run, "Would install 'ufw' package.")
+                    else:
+                        package_installs_status["ufw"] = install_apt_package(arguments.verbose, "ufw")
                 else:
                     _verbose_print(arguments.verbose, f"Package 'ufw' is already installed.")
                     package_installs_status["ufw"] = True
             elif os_distro in RHEL_LIKE:
                 if not is_dnf_package_installed("firewalld"):
-                    package_installs_status["firewalld"] = install_dnf_package(arguments.verbose, "firewalld")
+                    if arguments.dry_run:
+                        _dryrun_print(arguments.dry_run, "Would install 'firewalld' package.")
+                    else:
+                        package_installs_status["firewalld"] = install_dnf_package(arguments.verbose, "firewalld")
                 else:
                     _verbose_print(arguments.verbose, f"Package 'firewalld' is already installed.")
                     package_installs_status["firewalld"] = True
@@ -840,8 +853,9 @@ def main():
     #endregion
 
     confirmed = arguments.yes_all
+    __iterations = 1
     for suggestion in lynis_report.get("suggestion[]", []):
-        print(f"Suggestion: {suggestion.description} (Test ID: {suggestion.test_id})")
+        print(f"{__iterations:03d}: Suggestion: {suggestion.description} (Test ID: {suggestion.test_id})")
         if suggestion.test_id == "BOOT-5264":
             _verbose_print(arguments.verbose, f"Running 'systemd-analyze security' for each service...")
             try:
@@ -861,7 +875,7 @@ def main():
         #region KRNL-5820: Disable core dumps
         if suggestion.test_id == "KRNL-5820":
             if arguments.dry_run:
-                _dryrun_print("Would disable core dumps.")
+                _dryrun_print(arguments.dry_run, "Would disable core dumps.")
             elif not confirmed:
                 confirmed = get_confirmation("Do you want to disable core dumps? (y/n): ")
                 if not confirmed:
@@ -877,7 +891,7 @@ def main():
         if suggestion.test_id == "AUTH-9262":
             if get_distro(arguments.verbose) in DEBIAN_LIKE:
                 if arguments.dry_run:
-                    _dryrun_print("Would install 'libpam-cracklib' package.")
+                    _dryrun_print(arguments.dry_run, "Would install 'libpam-cracklib' package.")
                 else:
                     if not is_apt_package_installed("libpam-cracklib"):
                         package_installs_status["libpam-cracklib"] = install_apt_package(arguments.verbose, "libpam-cracklib")
@@ -886,7 +900,7 @@ def main():
                         package_installs_status["libpam-cracklib"] = True
             elif get_distro(arguments.verbose) in RHEL_LIKE:
                 if arguments.dry_run:
-                    _dryrun_print("Would install 'cracklib' package.")
+                    _dryrun_print(arguments.dry_run, "Would install 'cracklib' package.")
                 else:
                     if not is_dnf_package_installed("cracklib"):
                         package_installs_status["cracklib"] = install_dnf_package(arguments.verbose, "cracklib")
@@ -901,7 +915,7 @@ def main():
             if locked_users:
                 _warn_print(arguments.verbose, f"Locked users found: {', '.join(locked_users)}")
                 if arguments.dry_run:
-                    _dryrun_print(f"Would unlock the following users: {', '.join(locked_users)}")
+                    _dryrun_print(arguments.dry_run, f"Would unlock the following users: {', '.join(locked_users)}")
                 elif not confirmed:
                     confirmed = get_confirmation(f"Do you want to unlock the following users: {', '.join(locked_users)}? (y/n): ")
                     if not confirmed:
@@ -938,7 +952,7 @@ def main():
         #region NAME-4404: Update /etc/hosts with local IP and hostname
         if suggestion.test_id == "NAME-4404":
             if arguments.dry_run:
-                _dryrun_print("Would update /etc/hosts with local IP and hostname.")
+                _dryrun_print(arguments.dry_run, "Would update /etc/hosts with local IP and hostname.")
             elif not confirmed:
                 confirmed = get_confirmation("Do you want to update /etc/hosts with local IP and hostname? (y/n): ")
                 if not confirmed:
@@ -954,7 +968,7 @@ def main():
         if suggestion.test_id == "PKGS-7370":
             # Assume we're on a DEBIAN_LIKE system since debsums is a Debian utility.
             if arguments.dry_run:
-                _dryrun_print("Would install 'debsums' package.")
+                _dryrun_print(arguments.dry_run, "Would install 'debsums' package.")
             else:
                 if not is_apt_package_installed("debsums"):
                     package_installs_status["debsums"] = install_apt_package(arguments.verbose, "debsums")
@@ -967,7 +981,7 @@ def main():
         if suggestion.test_id == "PKGS-7394":
             # Assume we're on a DEBIAN_LIKE system since apt-show-versions is a Debian utility.
             if arguments.dry_run:
-                _dryrun_print("Would install 'apt-show-versions' package.")
+                _dryrun_print(arguments.dry_run, "Would install 'apt-show-versions' package.")
             else:
                 if not is_apt_package_installed("apt-show-versions"):
                     package_installs_status["apt-show-versions"] = install_apt_package(arguments.verbose, "apt-show-versions")
@@ -980,7 +994,7 @@ def main():
         if suggestion.test_id == "HRDN-7222":
             _warn_print(arguments.verbose, f"Hardening permissions on compilers may break some software builds. Please review your system's requirements before proceeding.")
             if arguments.dry_run:
-                _dryrun_print(f"Would harden permissions on compilers.")
+                _dryrun_print(arguments.dry_run, f"Would harden permissions on compilers.")
             elif not confirmed:
                 confirmed = get_confirmation(f"Do you want to harden permissions on compilers? (y/n): ")
                 if not confirmed:
@@ -1006,7 +1020,7 @@ def main():
             else:
                 _warn_print(f"Didn't match a recognized protocol in string: {suggestion.description}")
             if arguments.dry_run:
-                _dryrun_print(f"Disabling {_protocol}")
+                _dryrun_print(arguments.dry_run, f"Disabling {_protocol}")
             else:
                 if not confirmed:
                     confirmed = get_confirmation(f"Would you like to disable the {_protcol} protocol? (y/n):f")
@@ -1038,8 +1052,11 @@ def main():
                 else:
                     replacement_text = f"{pattern_key} {value}"
                 # DONE: need to account for patterns matching commented lines (and uncomment)
+                # TODO: Now need to check if a line has already been matched so an not to repeat config changes.
                 # TODO: need to check if the matched pattern already has the correct value.
                 sed_file("../sshd_config", pattern_key, replacement_text, arguments.verbose, arguments.dry_run)
+
+        __iterations = __iterations + 1
 
 if __name__=='__main__':
     raise SystemExit(main())
